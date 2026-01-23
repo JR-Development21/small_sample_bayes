@@ -63,7 +63,7 @@ def single_sim_sklearn_tuned(
         search = GridSearchCV(
             base_model,
             param_grid=param_grid,
-            scoring="balanced_accuracy",
+            scoring=neg_brier_scorer,
             cv=cv,
             n_jobs=1
         )
@@ -106,7 +106,7 @@ def single_sim_sklearn_tuned(
         base_model,
         {hyperparameters[i]:bs_ranges[i] for i in range(n_hyp)},
         n_iter=grid_search_size,
-        scoring="balanced_accuracy",
+        scoring=neg_brier_scorer,
         cv=5
     )
 

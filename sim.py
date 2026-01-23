@@ -23,6 +23,7 @@ from openml import datasets
 
 
 load_id_list = [722, 734, 735, 752, 761, 821, 833, 846, 847, 976, 977, 979, 1019, 1120, 1471]
+load_id_list = [722, 735, 846, 976]
 
 ######## SVC Notes #############
 # works for 722, 976
@@ -149,7 +150,7 @@ print(np.mean(sim_out.iloc[:, 3]))
 print()
 print(np.mean(sim_out.iloc[:, 5]))
 sim_out.to_csv(
-    f"C:/Users/ritch/Documents/DOE Papers/Small Sample ML Code/"
+    f"C:/Users/ritch/Documents/DOE Papers/Small Sample ML Code/small_sample_bayes/"
     f"{modelLoader['model_constructor']()}_brier_bayes_sim_out.csv",
     index=False
 )
