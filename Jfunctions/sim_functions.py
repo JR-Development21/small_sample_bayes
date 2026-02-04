@@ -10,6 +10,7 @@ from sklearn.model_selection import (
     cross_val_score
 )
 from sklearn.metrics import balanced_accuracy_score, log_loss, brier_score_loss, make_scorer
+from sklearn.base import clone
 from scipy.optimize import minimize
 import statsmodels.formula.api as smf
 from skopt import BayesSearchCV
@@ -93,7 +94,10 @@ def single_sim_sklearn_tuned(
 
 
     grid_search_test_acc = balanced_accuracy_score(ytest, yhat_test)
-    grid_search_val_acc = search.best_score_
+    grid_search_val_acc = balanced_accuracy_score(
+        ytrain,
+        best_model.predict(Xtrain)
+    )
 
     gs_hyp_vals = {
         f"{hp}_gs": search.best_params_[hp]
@@ -112,12 +116,23 @@ def single_sim_sklearn_tuned(
 
     opt.fit(Xtrain, ytrain)
 
-    bayes_val_acc = opt.best_score_
-    best_model = opt.best_estimator_
+    # 1. Get the "smoothed" best parameters from the Gaussian Process
+    expected_params = util_functions.get_expected_minimum(opt)
+
+    # 2. Create a fresh model instance with these parameters
+    # We use clone() to ensure we get a fresh copy of base_model, then set params
+    best_model = clone(base_model)
+    best_model.set_params(**expected_params)
+
+    # 3. Fit this new model on the full training set
     best_model.fit(Xtrain, ytrain)
     bayes_test_acc = balanced_accuracy_score(
         ytest,
         best_model.predict(Xtest)
+    )
+    bayes_val_acc = balanced_accuracy_score(
+        ytrain,
+        best_model.predict(Xtrain)
     )
 
     bayes_hyp_vals = {

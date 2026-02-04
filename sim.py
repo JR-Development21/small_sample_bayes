@@ -4,7 +4,7 @@ os.environ["MKL_NUM_THREADS"] = "1"
 os.environ["OPENBLAS_NUM_THREADS"] = "1"
 
 os.chdir(
-    r"C:/Users/ritch/Documents/DOE Papers/Small Sample ML Code/Python/"
+    r"C:/Users/ritch/Documents/DOE Papers/Small Sample ML Code/small_sample_bayes/"
 )
 
 from joblib import Parallel, delayed

@@ -71,3 +71,35 @@ def prob_log_loss(yhat, y, eps=1e-15):
         y_bin * np.log(yhat) +
         (1.0 - y_bin) * np.log(1.0 - yhat)
     )
+
+def get_expected_minimum(fitted_opt, n_samples=100000):
+    """
+    Extracts the GP model and finds the parameters that minimize the 
+    GP mean function (The Expected Minimum).
+    """
+    # 1. Extract the result object from the optimizer
+    # optimizer_results_ is a list; usually we want the first/only run.
+    result = fitted_opt.optimizer_results_[0]
+    
+    # 2. Get the final fitted GP model (Surrogate)
+    # The model is trained on the *transformed* space (encoded categoricals)
+    gp_model = result.models[-1]
+    
+    # 3. Create a dense grid of random samples from the search space
+    # result.space handles the complexity of categorical/integer generation
+    potential_params = result.space.rvs(n_samples=n_samples)
+    
+    # 4. Transform these parameters into the format the GP expects
+    # (e.g., converting 'rbf' to integer 1, scaling log-uniforms, etc.)
+    X_transformed = result.space.transform(potential_params)
+    
+    # 5. Predict the mean validation score for all samples
+    # Note: GP predicts negative scores if maximizing, but skopt minimizes internally.
+    # We simply look for the mathematical minimum of the surrogate output.
+    pred_means = gp_model.predict(X_transformed)
+    
+    # 6. Find the index of the minimum mean
+    best_idx = np.argmin(pred_means)
+    
+    # 7. Return the human-readable parameters
+    return dict(zip(fitted_opt.search_spaces.keys(), potential_params[best_idx]))
