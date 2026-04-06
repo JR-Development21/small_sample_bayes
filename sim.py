@@ -4,7 +4,7 @@ os.environ["MKL_NUM_THREADS"] = "1"
 os.environ["OPENBLAS_NUM_THREADS"] = "1"
 
 os.chdir(
-    r"C:/Users/ritch/Documents/DOE Papers/Small Sample ML Code/small_sample_bayes/"
+    r"C:/Users/ritch/Documents/DOE Papers/Small Sample ML Code/small_sample_conf/"
 )
 
 from joblib import Parallel, delayed
@@ -19,11 +19,12 @@ from sklearn.ensemble import RandomForestClassifier, GradientBoostingClassifier
 from sklearn.pipeline import make_pipeline
 from xgboost import XGBClassifier
 from openml import datasets
+from sklearn.metrics import brier_score_loss, balanced_accuracy_score, accuracy_score
 
 
 
 load_id_list = [722, 734, 735, 752, 761, 821, 833, 846, 847, 976, 977, 979, 1019, 1120, 1471]
-load_id_list = [722, 735, 846, 976]
+load_id_list = [846]
 
 ######## SVC Notes #############
 # works for 722, 976
@@ -33,10 +34,17 @@ load_id_list = [722, 735, 846, 976]
 ######## Boosting notes #########
 # works for 735, 722, 976, 846
 
-nsim = 25
+nsim = 10
 gridSize = 25
 n_samps_list = [10, 20, 50, 100, 200]
+n_samps_list = [10, 200]
 searchMethod = "Grid"
+
+use_predict_proba_if_available = True
+metric_fn = lambda x,y: brier_score_loss(x,y,pos_label='P')
+
+use_predict_proba_if_available = False
+metric_fn = lambda x,y: -accuracy_score(x,y)
 
 modelLoader = loaders.model_loader_maker(
     model_constructor=lambda **kw: SVC(probability=True, **kw),
@@ -46,23 +54,6 @@ modelLoader = loaders.model_loader_maker(
     logList=[True, True],
     round_param=[False, False]
 )
-# for 735
-# modelLoader = loaders.model_loader_maker(
-#     model_constructor=lambda **kw: SVC(probability=True, **kw),
-#     hyperparameters=["C", "gamma"],
-#     hyperparameter_low=[2**-5, 10**-15],
-#     hyperparameter_high=[1, 1],
-#     logList=[True, True],
-#     round_param=[False, False]
-# )
-# modelLoader = loaders.model_loader_maker(
-#     model_constructor=lambda **kw: NuSVC(probability=True, **kw),
-#     hyperparameters=["gamma", "nu"],
-#     hyperparameter_low=[2**-15, 2**-15],
-#     hyperparameter_high=[2**3, 1 - 2**-15],
-#     logList=[True, False],
-#     round_param=[False, False]
-# )
 # modelLoader = loaders.model_loader_maker(
 #     model_constructor=lambda **kw: GradientBoostingClassifier(**kw),
 #     hyperparameters=["learning_rate", "n_estimators", "max_depth"],
@@ -70,6 +61,22 @@ modelLoader = loaders.model_loader_maker(
 #     hyperparameter_high=[1, 1000, 15],
 #     logList=[True, True, False],
 #     round_param=[False, True, True]
+# )
+# modelLoader = loaders.model_loader_maker(
+#     model_constructor=lambda **kw: GradientBoostingClassifier(**kw),
+#     hyperparameters=["learning_rate"],
+#     hyperparameter_low=[2**-10],
+#     hyperparameter_high=[1],
+#     logList=[True],
+#     round_param=[False]
+# )
+# modelLoader = loaders.model_loader_maker(
+#     model_constructor=lambda **kw: GradientBoostingClassifier(**kw),
+#     hyperparameters=["learning_rate", "n_estimators"],
+#     hyperparameter_low=[2**-10, 100],
+#     hyperparameter_high=[1, 1000],
+#     logList=[True, False],
+#     round_param=[False, True]
 # )
 
 designLoader = loaders.design_loader_maker(
@@ -89,12 +96,12 @@ def run_single_sim(j, df, n_samps, modelLoader, designLoader, gridSize, searchMe
         n_samps=n_samps
     )
 
-    result = sim_functions.single_sim_sklearn_tuned(
+    result = sim_functions.single_sim_conf_int(
         dataLoader,
         modelLoader,
         designLoader,
-        grid_search_size=gridSize,
-        searchMethod=searchMethod
+        use_predict_proba_if_available=use_predict_proba_if_available,
+        metric_fn=metric_fn
     )
 
     return result
@@ -137,20 +144,10 @@ for i, load_id in enumerate(load_id_list):
 
 
 sim_out = pd.concat(full_sim, ignore_index=True)
-print()
-print(np.mean(sim_out.iloc[:, 0] - sim_out.iloc[:, 1]))
-print()
-print(np.mean(sim_out.iloc[:, 2] - sim_out.iloc[:, 3]))
-print()
-print(np.mean(sim_out.iloc[:, 4] - sim_out.iloc[:, 5]))
-print()
-print(np.mean(sim_out.iloc[:, 1]))
-print()
-print(np.mean(sim_out.iloc[:, 3]))
-print()
-print(np.mean(sim_out.iloc[:, 5]))
+[sim_out.bbc_ci[i][0] < sim_out.bbc_test_func[i] < sim_out.bbc_ci[i][1] for i in range(len(sim_out))]
+[sim_out.base_ci[i][0] < sim_out.base_test_func[i] < sim_out.base_ci[i][1] for i in range(len(sim_out))]
 sim_out.to_csv(
-    f"C:/Users/ritch/Documents/DOE Papers/Small Sample ML Code/small_sample_bayes/"
+    f"C:/Users/ritch/Documents/DOE Papers/Small Sample ML Code/small_sample_conf/"
     f"{modelLoader['model_constructor']()}_brier_bayes_sim_out.csv",
     index=False
 )

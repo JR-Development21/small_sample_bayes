@@ -1,5 +1,7 @@
 import numpy as np
 import pandas as pd
+import numpy as np
+import matplotlib as plt
 from typing import Sequence
 
 def design_rescaler(vec, minv, maxv):
@@ -103,3 +105,34 @@ def get_expected_minimum(fitted_opt, n_samples=100000):
     
     # 7. Return the human-readable parameters
     return dict(zip(fitted_opt.search_spaces.keys(), potential_params[best_idx]))
+
+
+def plot_mean_with_bounds(df, x_col=None, mean_col="means", lower_col="lower", upper_col="upper"):
+    """
+    Plot a line for the mean and a shaded band for lower/upper bounds.
+
+    Parameters
+    ----------
+    df : pandas.DataFrame
+        DataFrame containing the data.
+    x_col : str or None
+        Column to use for the x-axis. If None, the DataFrame index is used.
+    mean_col : str
+        Column name for the mean values.
+    lower_col : str
+        Column name for the lower bound.
+    upper_col : str
+        Column name for the upper bound.
+    """
+    x = df.index if x_col is None else df[x_col]
+
+    plt.figure(figsize=(8, 5))
+    plt.plot(x, df[mean_col], label="Mean")
+    plt.plot(x, df[lower_col], linestyle="--", label="Lower")
+    plt.plot(x, df[upper_col], linestyle="--", label="Upper")
+
+    plt.xlabel("Learning Rate")
+    plt.ylabel("MSE")
+    plt.legend()
+    plt.tight_layout()
+    plt.show()

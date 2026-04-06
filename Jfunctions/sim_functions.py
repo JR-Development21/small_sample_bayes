@@ -7,14 +7,13 @@ from sklearn.model_selection import (
     GridSearchCV,
     RandomizedSearchCV,
     StratifiedKFold,
-    cross_val_score
+    cross_val_score,
+    RepeatedStratifiedKFold
 )
 from sklearn.metrics import balanced_accuracy_score, log_loss, brier_score_loss, make_scorer
 from sklearn.base import clone
-from scipy.optimize import minimize
-import statsmodels.formula.api as smf
-from skopt import BayesSearchCV
-from skopt.space import Real, Integer
+from typing import Callable, List, Dict, Any, Optional
+
 
 neg_brier_scorer = make_scorer(
     brier_score_loss,
@@ -23,364 +22,250 @@ neg_brier_scorer = make_scorer(
     pos_label='P' # Optionally specify the positive label
 )
 
-def single_sim_sklearn_tuned(
-    data_loader,
-    model_loader,
-    design_loader,
-    grid_search_size=100,
-    searchMethod="Grid"
-):
-    hyperparameters = model_loader["hyperparameters"]
-    n_hyp = len(hyperparameters)
+def repeated_bbc_cv(
+    X: np.ndarray,
+    y: np.ndarray,
+    Xtest: np.ndarray,
+    ytest: np.ndarray,
+    estimator,
+    param_list: List[dict],
+    metric_fn: Callable[[np.ndarray, np.ndarray], float],
+    *,
+    n_splits: int = 5,
+    n_repeats: int = 10,
+    n_bootstraps: int = 1000,
+    random_state: Optional[int] = None,
+    use_predict_proba_if_available: bool = True,
+    ci_alpha: float = 0.05
+) -> Dict[str, Any]:
 
-    rep_hyp = int(np.ceil(grid_search_size ** (1 / n_hyp)))
+    rng = np.random.default_rng(random_state)
 
-    logList = model_loader["logList"]
-    if logList is None:
-        logList = [False] * n_hyp
-
-    lows = model_loader["hyperparameter_low"]
-    highs = model_loader["hyperparameter_high"]
-    round_param = model_loader["round_param"]
-    base_model = model_loader["model_constructor"]()
-    param_grid = {}
-
-    for i, hp in enumerate(hyperparameters):
-        if logList[i]:
-            param_grid[hp] = np.logspace(
-                np.log10(lows[i]),
-                np.log10(highs[i]),
-                rep_hyp
-            )
-        else:
-            param_grid[hp] = np.linspace(lows[i], highs[i], rep_hyp)
-
-        if round_param[i]:
-            param_grid[hp] = np.unique(np.round(param_grid[hp]).astype(int))
-    
-    cv = StratifiedKFold(n_splits=5, shuffle=True)
-
-    if searchMethod == "Grid":
-        search = GridSearchCV(
-            base_model,
-            param_grid=param_grid,
-            scoring=neg_brier_scorer,
-            cv=cv,
-            n_jobs=1
-        )
-    elif searchMethod == "Random":
-        search = RandomizedSearchCV(
-            base_model,
-            param_distributions=param_grid,
-            n_iter=grid_search_size,
-            scoring="balanced_accuracy",
-            cv=cv,
-            n_jobs=1
-        )
+    if use_predict_proba_if_available:
+        y = y
+        ytest = ytest
     else:
-        raise NotImplementedError("Latin Hypercube requires custom implementation")
+        y = pd.Series([1 if i=="P" else 0 for i in y])
+        ytest = pd.Series([1 if i=="P" else 0 for i in ytest])
 
-    Xtrain = data_loader["train_data"].iloc[:, data_loader["feature_cols"]]
-    ytrain = data_loader["train_data"].iloc[:, data_loader["target_col"]]
+    n = len(y)
+    C = len(param_list)
 
-    Xtest = data_loader["test_data"].iloc[:, data_loader["feature_cols"]]
-    ytest = data_loader["test_data"].iloc[:, data_loader["target_col"]]
+    # ---- pooled OOF predictions ----
+    Pi = np.zeros((n * n_repeats, C), dtype=float)
+    Pi_base = np.zeros((n * n_repeats, 1), dtype=float)
 
-    search.fit(Xtrain, ytrain)
+    # must match repeat-major ordering
+    y_rep = np.tile(y, n_repeats)
 
-    best_model = search.best_estimator_
-
-    yhat_test = best_model.predict(Xtest)
-
-
-    grid_search_test_acc = balanced_accuracy_score(ytest, yhat_test)
-    grid_search_val_acc = balanced_accuracy_score(
-        ytrain,
-        best_model.predict(Xtrain)
+    cv = RepeatedStratifiedKFold(
+        n_splits=n_splits,
+        n_repeats=n_repeats,
+        random_state=random_state
     )
 
-    gs_hyp_vals = {
-        f"{hp}_gs": search.best_params_[hp]
-        for hp in hyperparameters
-    }
+    # ---- collect OOF predictions ----
+    for fold_id, (train_idx, test_idx) in enumerate(cv.split(X, y)):
 
-    bs_logs = ["log-uniform" if logtrue else "uniform" for logtrue in logList]
-    bs_ranges = [Integer(low = lows[i], high = highs[i], prior = bs_logs[i]) if round_param[i] else Real(low = lows[i], high = highs[i], prior = bs_logs[i]) for i in range(n_hyp)]
-    opt = BayesSearchCV(
-        base_model,
-        {hyperparameters[i]:bs_ranges[i] for i in range(n_hyp)},
-        n_iter=grid_search_size,
-        scoring=neg_brier_scorer,
-        cv=5
-    )
+        r = fold_id // n_splits
+        row_idx = test_idx + r * n
 
-    opt.fit(Xtrain, ytrain)
+        # fit base model
+        model = clone(estimator)
+        model.fit(X.iloc[train_idx, :], y[train_idx])
+        if use_predict_proba_if_available and hasattr(model, "predict_proba"):
+            preds = model.predict_proba(X.iloc[test_idx, :])[:, 1]
+        else:
+            preds = model.predict(X.iloc[test_idx, :])
 
-    # 1. Get the "smoothed" best parameters from the Gaussian Process
-    expected_params = util_functions.get_expected_minimum(opt)
+        Pi_base[row_idx, 0] = preds
 
-    # 2. Create a fresh model instance with these parameters
-    # We use clone() to ensure we get a fresh copy of base_model, then set params
-    best_model = clone(base_model)
-    best_model.set_params(**expected_params)
+        # fit other parameter combinations
+        for c, params in enumerate(param_list):
 
-    # 3. Fit this new model on the full training set
-    best_model.fit(Xtrain, ytrain)
-    bayes_test_acc = balanced_accuracy_score(
-        ytest,
-        best_model.predict(Xtest)
-    )
-    bayes_val_acc = balanced_accuracy_score(
-        ytrain,
-        best_model.predict(Xtrain)
-    )
+            model = clone(estimator)
+            model.set_params(**params)
 
-    bayes_hyp_vals = {
-        f"{hp}_bayes": opt.best_params_[hp]
-        for hp in hyperparameters
-    }
+            model.fit(X.iloc[train_idx, :], y[train_idx])
 
-    des_grid_real = pd.DataFrame()
-
-    for i, hp in enumerate(hyperparameters):
-        des_grid_real[hp] = util_functions.design_log_rescaler(
-            design_loader.iloc[:, i].values,
-            lows[i],
-            highs[i],
-            logList[i]
-        )
-
-    des_scores = []
-
-    for _, row in des_grid_real.iterrows():
-        params = {}
-
-        for i, hp in enumerate(model_loader["hyperparameters"]):
-            val = row[hp]
-
-            if model_loader["round_param"][i]:
-                params[hp] = int(round(val))
+            if use_predict_proba_if_available and hasattr(model, "predict_proba"):
+                preds = model.predict_proba(X.iloc[test_idx, :])[:, 1]
             else:
-                params[hp] = float(val)
+                preds = model.predict(X.iloc[test_idx, :])
 
-        model = model_loader["model_constructor"](**params)
+            Pi[row_idx, c] = preds
 
-        scores = cross_val_score(
-            model,
-            Xtrain,
-            ytrain,
-            scoring=neg_brier_scorer,
-            # scoring = "neg_log_loss",
-            cv=cv
-        )
-        des_scores.append(-scores.mean())
+    # ---- select best config on full pooled predictions (CVT step) ----
+    full_scores = []
+    for c in range(C):
+        try:
+            s = metric_fn(y_rep, Pi[:, c])
+        except Exception:
+            s = -np.inf
+        full_scores.append(s)
 
-    df_surrogate = pd.DataFrame()
+    best_config_full = int(np.argmin(full_scores))
 
-    for i, hp in enumerate(hyperparameters):
-        df_surrogate[hp] = util_functions.design_log_scaler(
-            des_grid_real[hp].values,
-            lows[i],
-            highs[i],
-            logList[i]
-        )
+    # ---- BBC bootstrap ----
+    L = []
+    L_rand = []
+    L_base = []
 
-    df_surrogate["Accuracy"] = des_scores
+    for _ in range(n_bootstraps):
 
-    terms = hyperparameters
+        # sample instances
+        sampled = rng.integers(0, n, size=n)
 
-    main_terms = " + ".join(terms)
-    quad_terms = " + ".join([f"I({t}**2)" for t in terms])
-    cubic_terms = " + ".join([f"I({t}**3)" for t in terms])
+        # find OOB instances
+        present = np.zeros(n, dtype=bool)
+        present[np.unique(sampled)] = True
+        oob = np.where(~present)[0]
 
-    interaction_terms = " + ".join(
-        f"{t1}:{t2}"
-        for i, t1 in enumerate(terms)
-        for t2 in terms[i+1:]
-    )
+        if len(oob) == 0:
+            continue
 
-    all_terms = " + ".join(
-        t for t in [main_terms, quad_terms, cubic_terms, interaction_terms] if t
-    )
+        # expand rows (include all repeats)
+        boot_rows = np.concatenate([sampled + r*n for r in range(n_repeats)])
+        oob_rows  = np.concatenate([oob     + r*n for r in range(n_repeats)])
 
-    formula = f"Accuracy ~ {all_terms}"
-    lm_model = smf.ols(formula, data=df_surrogate).fit()
+        # ---- selection inside bootstrap ----
+        scores_boot = []
+        for c in range(C):
+            try:
+                s = metric_fn(y_rep[boot_rows], Pi[boot_rows, c])
+            except Exception:
+                s = np.inf
+            scores_boot.append(s)
 
-    def f_to_min(x):
-        row = {hp: x[i] for i, hp in enumerate(hyperparameters)}
-        df = pd.DataFrame([row])
-        return lm_model.predict(df).iloc[0]
+        best_c = int(np.argmin(scores_boot))
+        rand_c =  rng.integers(0, C, size=1)
 
-    bounds = [(-1.0, 1.0)] * n_hyp
+        # ---- evaluate selected config on OOB ----
+        try:
+            Lb = metric_fn(y_rep[oob_rows], Pi[oob_rows, best_c])
+            Lb_rand = metric_fn(y_rep[oob_rows], Pi[oob_rows, rand_c])
+            Lb_base = metric_fn(y_rep[oob_rows], Pi_base[oob_rows, 0])
+        except Exception:
+            continue
 
-    start_vals = [(0)] * n_hyp
+        L.append(Lb)
+        L_rand.append(Lb_rand)
+        L_base.append(Lb_base)
 
-    res = minimize(
-        f_to_min,
-        x0=start_vals,
-        bounds=bounds,
-        method="L-BFGS-B"
-    )
+    L = np.array(L)
+    L_rand = np.array(L_rand)
+    L_base = np.array(L_base)
 
-    doe_pars_coded = res.x
-    doe_vals = []
-    for i in range(n_hyp):
-        v = util_functions.design_log_rescaler(
-            [doe_pars_coded[i]],
-            lows[i],
-            highs[i],
-            logList[i]
-        )[0]
-        if round_param[i]:
-            v = int(round(v))
-        doe_vals.append(v)
+    # ---- summarize ----
+    mean_perf = np.mean(L)
+    ci = np.percentile(L, [100 * ci_alpha / 2, 100 * (1 - ci_alpha / 2)])
 
-    doe_params = dict(zip(hyperparameters, doe_vals))
-    doe_model = model_loader["model_constructor"](**doe_params)
+    mean_rand = np.mean(L_rand)
+    ci_rand = np.percentile(L_rand, [100 * ci_alpha / 2, 100 * (1 - ci_alpha / 2)])
+    ci_diff_rand = np.percentile(L - L_rand, [100 * ci_alpha / 2, 100 * (1 - ci_alpha / 2)])
 
-    doe_model.fit(Xtrain, ytrain)
-    yhat_doe = doe_model.predict(Xtest)
+    mean_base = np.mean(L_base)
+    ci_base = np.percentile(L_base, [100 * ci_alpha / 2, 100 * (1 - ci_alpha / 2)])
+    ci_diff_base = np.percentile(L - L_base, [100 * ci_alpha / 2, 100 * (1 - ci_alpha / 2)])
 
-    doe_test_acc = balanced_accuracy_score(ytest, yhat_doe)
-    doe_val_acc = cross_val_score(
-        doe_model,
-        Xtrain,
-        ytrain,
-        scoring="balanced_accuracy",
-        cv=cv
-    ).mean()
 
-    baseline = model_loader["model_constructor"]()
-    baseline.fit(Xtrain, ytrain)
+    # Get back best models
+    model = clone(estimator)
+    model.set_params(**param_list[best_config_full])
 
-    yhat_baseline = baseline.predict(Xtest)
-    baseline_test_acc = balanced_accuracy_score(ytest, yhat_baseline)
+    model.fit(X, y)
+    if use_predict_proba_if_available and hasattr(model, "predict_proba"):
+        yhat_test = model.predict_proba(Xtest)[:, 1]
+    else:
+        yhat_test = model.predict(Xtest)
 
-    baseline_val_acc = cross_val_score(
-        baseline,
-        Xtrain,
-        ytrain,
-        scoring="balanced_accuracy",
-        cv=cv
-    ).mean()
+    bbc_test_func = metric_fn(ytest, yhat_test)
+
+    #define base model
+    base_model = clone(estimator)
+
+    base_model.fit(X, y)
+    if use_predict_proba_if_available and hasattr(base_model, "predict_proba"):
+        yhat_test = base_model.predict_proba(Xtest)[:, 1]
+    else:
+        yhat_test = base_model.predict(Xtest)
+    base_test_func = metric_fn(ytest, yhat_test)
 
     return {
-        "grid_search_val_acc": grid_search_val_acc,
-        "grid_search_test_acc": grid_search_test_acc,
-        "bayes_val_acc": bayes_val_acc,
-        "bayes_test_acc": bayes_test_acc,
-        "doe_val_acc": doe_val_acc,
-        "doe_test_acc": doe_test_acc,
-        "baseline_val_acc": baseline_val_acc,
-        "baseline_test_acc": baseline_test_acc,
-        **gs_hyp_vals,
-        **bayes_hyp_vals,
-        **{f"{hp}_doe": doe_params[hp] for hp in hyperparameters}
+        "bbc_estimate": mean_perf,
+        "bbc_ci": ci,
+        "rand_estimate": mean_rand,
+        "rand_ci": ci_rand,
+        "diff_rand_ci": ci_diff_rand,
+        "base_estimate": mean_base,
+        "base_ci": ci_base,
+        "diff_base_ci": ci_diff_base,
+        "bootstrap_values": L,
+        "rand_values": L_rand,
+        "best_config_index": best_config_full,
+        "best_params": param_list[best_config_full],
+        "bbc_test_func": bbc_test_func,
+        "base_test_func": base_test_func,
+        # "bbc_test_ba": bbc_test,
+        # "base_test_ba": base_test
     }
 
-def plot_sim(
-    data_loader,
-    model_loader,
-    design_loader
-):
-    hyperparameters = model_loader["hyperparameters"]
+
+
+def single_sim_conf_int(
+        dataLoader, 
+        modelLoader,
+        designLoader,
+        use_predict_proba_if_available: bool = True,
+        metric_fn = lambda x,y: brier_score_loss(x,y,pos_label='P')
+        ):
+    Xtrain = dataLoader["train_data"].iloc[:, dataLoader["feature_cols"]]
+    ytrain = dataLoader["train_data"].iloc[:, dataLoader["target_col"]]
+    Xtest = dataLoader["test_data"].iloc[:, dataLoader["feature_cols"]]
+    ytest = dataLoader["test_data"].iloc[:, dataLoader["target_col"]]
+    estimator = modelLoader["model_constructor"]()
+    des_grid_real = pd.DataFrame()
+
+    hyperparameters = modelLoader["hyperparameters"]
     n_hyp = len(hyperparameters)
 
-
-    logList = model_loader["logList"]
+    logList = modelLoader["logList"]
     if logList is None:
         logList = [False] * n_hyp
 
-    lows = model_loader["hyperparameter_low"]
-    highs = model_loader["hyperparameter_high"]
-    round_param = model_loader["round_param"]
-    
-
-    Xtrain = data_loader["train_data"].iloc[:, data_loader["feature_cols"]]
-    ytrain = data_loader["train_data"].iloc[:, data_loader["target_col"]]
-
-    Xtest = data_loader["test_data"].iloc[:, data_loader["feature_cols"]]
-    ytest = data_loader["test_data"].iloc[:, data_loader["target_col"]]
-
-    cv = StratifiedKFold(n_splits=5, shuffle=True)
-
-    des_grid_real = pd.DataFrame()
+    lows = modelLoader["hyperparameter_low"]
+    highs = modelLoader["hyperparameter_high"]
 
     for i, hp in enumerate(hyperparameters):
         des_grid_real[hp] = util_functions.design_log_rescaler(
-            design_loader.iloc[:, i].values,
+            designLoader.iloc[:, i].values,
             lows[i],
             highs[i],
             logList[i]
         )
 
-    des_scores = []
+    des_grid = []
 
     for _, row in des_grid_real.iterrows():
         params = {}
 
-        for i, hp in enumerate(model_loader["hyperparameters"]):
+        for i, hp in enumerate(modelLoader["hyperparameters"]):
             val = row[hp]
 
-            if model_loader["round_param"][i]:
+            if modelLoader["round_param"][i]:
                 params[hp] = int(round(val))
             else:
                 params[hp] = float(val)
-
-        model = model_loader["model_constructor"](**params)
-
-        scores = cross_val_score(
-            model,
-            Xtrain,
-            ytrain,
-            # scoring=neg_brier_scorer,
-            scoring = "neg_log_loss",
-            cv=cv
-        )
-        des_scores.append(-scores.mean())
-
-    df_surrogate = pd.DataFrame()
-
-    for i, hp in enumerate(hyperparameters):
-        df_surrogate[hp] = util_functions.design_log_scaler(
-            des_grid_real[hp].values,
-            lows[i],
-            highs[i],
-            logList[i]
-        )
-
-    df_surrogate["Accuracy"] = des_scores
-
-    terms = hyperparameters
-
-    main_terms = " + ".join(terms)
-    quad_terms = " + ".join([f"I({t}**2)" for t in terms])
-    cubic_terms = " + ".join([f"I({t}**3)" for t in terms])
-
-    interaction_terms = " + ".join(
-        f"{t1}:{t2}"
-        for i, t1 in enumerate(terms)
-        for t2 in terms[i+1:]
-    )
-
-    all_terms = " + ".join(
-        t for t in [main_terms, quad_terms, cubic_terms, interaction_terms] if t
-    )
-
-    formula = f"Accuracy ~ {all_terms}"
-    lm_model_cubic = smf.ols(formula, data=df_surrogate).fit()
-
-    all_terms = " + ".join(
-        t for t in [main_terms, quad_terms, interaction_terms] if t
-    )
-
-    formula = f"Accuracy ~ {all_terms}"
-    lm_model_quadratic = smf.ols(formula, data=df_surrogate).fit()
+        des_grid.append(params)
 
 
-    return {
-        "cubic_model": lm_model_cubic,
-        "quad_model": lm_model_quadratic,
-        "df_surrogate": df_surrogate
-    }
-
+    output = repeated_bbc_cv(Xtrain, 
+                             ytrain,
+                             Xtest, 
+                             ytest, 
+                             estimator, 
+                             des_grid, 
+                             metric_fn=metric_fn, 
+                             n_bootstraps = 1000, 
+                             use_predict_proba_if_available = use_predict_proba_if_available)
+    return output
